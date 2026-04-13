@@ -20,6 +20,7 @@ from cellbender.remove_background.checkpoint import load_from_checkpoint, \
     unpack_tarball, make_tarball, load_checkpoint
 from cellbender.remove_background.data.io import \
     write_posterior_coo_to_h5, load_posterior_from_h5
+from cellbender.remove_background.memory import is_cuda_oom_error, get_reduced_batch_size
 
 from typing import Tuple, List, Dict, Optional, Union, Callable
 from abc import ABC, abstractmethod
@@ -32,6 +33,10 @@ import os
 
 
 logger = logging.getLogger('cellbender')
+
+
+def _get_device(use_cuda: bool) -> str:
+    return 'cuda' if use_cuda else 'cpu'
 
 
 def load_or_compute_posterior_and_save(dataset_obj: 'SingleCellRNACountsDataset',
@@ -71,7 +76,7 @@ def load_or_compute_posterior_and_save(dataset_obj: 'SingleCellRNACountsDataset'
                 posterior.regularize_posterior(
                     regularization=PRq,
                     alpha=args.prq_alpha,
-                    device='cuda',
+                    device=_get_device(args.use_cuda),
                 )
             elif args.posterior_regularization == 'PRmu':
                 posterior.regularize_posterior(
@@ -79,7 +84,7 @@ def load_or_compute_posterior_and_save(dataset_obj: 'SingleCellRNACountsDataset'
                     raw_count_matrix=dataset_obj.data['matrix'],
                     fpr=args.fpr[0],
                     per_gene=False,
-                    device='cuda',
+                    device=_get_device(args.use_cuda),
                 )
             elif args.posterior_regularization == 'PRmu_gene':
                 posterior.regularize_posterior(
@@ -87,7 +92,7 @@ def load_or_compute_posterior_and_save(dataset_obj: 'SingleCellRNACountsDataset'
                     raw_count_matrix=dataset_obj.data['matrix'],
                     fpr=args.fpr[0],
                     per_gene=True,
-                    device='cuda',
+                    device=_get_device(args.use_cuda),
                 )
             else:
                 raise ValueError(f'Got a posterior regularization input of '
@@ -213,6 +218,27 @@ class Posterior:
                 total_n_cells=dataset_obj.data['matrix'].shape[0],
                 total_n_genes=dataset_obj.data['matrix'].shape[1],
             )
+
+    def _log_cuda_oom_and_reduce_batch_size(self,
+                                            error: RuntimeError,
+                                            batch_size: int,
+                                            operation_name: str) -> int:
+        if not (self.use_cuda and is_cuda_oom_error(error)):
+            raise error
+
+        new_batch_size = get_reduced_batch_size(batch_size)
+        if new_batch_size is None:
+            raise RuntimeError(
+                f'CUDA ran out of memory during {operation_name} even at the '
+                f'minimum supported minibatch size {batch_size}.'
+            ) from error
+
+        logger.warning('CUDA out of memory during %s with batch size %d. '
+                       'Retrying with batch size %d.',
+                       operation_name, batch_size, new_batch_size)
+        torch.cuda.empty_cache()
+        self.posterior_batch_size = new_batch_size
+        return new_batch_size
 
     def save(self, file: str) -> bool:
         """Save the full posterior in HDF5 format."""
@@ -431,119 +457,129 @@ class Posterior:
 
         logger.debug('Computing full posterior noise counts')
 
-        # Compute posterior in mini-batches.
-        torch.cuda.empty_cache()
+        batch_size = self.posterior_batch_size
+        while True:
+            try:
+                # Compute posterior in mini-batches.
+                torch.cuda.empty_cache()
 
-        # Dataloader for cells only.
-        analyzed_bcs_only = True
-        count_matrix = self.dataset_obj.get_count_matrix()  # analyzed barcodes
-        cell_logic = (self.latents_map['p'] > consts.CELL_PROB_CUTOFF)
+                # Dataloader for cells only.
+                analyzed_bcs_only = True
+                count_matrix = self.dataset_obj.get_count_matrix()  # analyzed barcodes
+                cell_logic = (self.latents_map['p'] > consts.CELL_PROB_CUTOFF)
 
-        # Raise an error if there are no cells found.
-        if cell_logic.sum() == 0:
-            logger.error(f'ERROR: Found zero droplets with posterior cell '
-                         f'probability > {consts.CELL_PROB_CUTOFF}. Please '
-                         f'check the log for estimated priors on expected cells, '
-                         f'total droplets included, UMI counts per cell, and '
-                         f'UMI counts in empty droplets, and see whether these '
-                         f'values make sense. Consider using additional input '
-                         f'arguments like --expected-cells, '
-                         f'--total-droplets-included, --force-cell-umi-prior, '
-                         f'and --force-empty-umi-prior, to make these values '
-                         f'accurate for your dataset.')
-            raise RuntimeError('Zero cells found!')
+                # Raise an error if there are no cells found.
+                if cell_logic.sum() == 0:
+                    logger.error(f'ERROR: Found zero droplets with posterior cell '
+                                 f'probability > {consts.CELL_PROB_CUTOFF}. Please '
+                                 f'check the log for estimated priors on expected cells, '
+                                 f'total droplets included, UMI counts per cell, and '
+                                 f'UMI counts in empty droplets, and see whether these '
+                                 f'values make sense. Consider using additional input '
+                                 f'arguments like --expected-cells, '
+                                 f'--total-droplets-included, --force-cell-umi-prior, '
+                                 f'and --force-empty-umi-prior, to make these values '
+                                 f'accurate for your dataset.')
+                    raise RuntimeError('Zero cells found!')
 
-        dataloader_index_to_analyzed_bc_index = torch.where(torch.tensor(cell_logic))[0]
-        cell_data_loader = DataLoader(
-            count_matrix[cell_logic],
-            empty_drop_dataset=None,
-            batch_size=self.posterior_batch_size,
-            fraction_empties=0.,
-            shuffle=False,
-            use_cuda=self.use_cuda,
-        )
+                dataloader_index_to_analyzed_bc_index = torch.where(torch.tensor(cell_logic))[0]
+                cell_data_loader = DataLoader(
+                    count_matrix[cell_logic],
+                    empty_drop_dataset=None,
+                    batch_size=batch_size,
+                    fraction_empties=0.,
+                    shuffle=False,
+                    use_cuda=self.use_cuda,
+                )
 
-        bcs = []  # barcode index
-        genes = []  # gene index
-        c = []  # noise count value
-        c_offset = []  # noise count offsets from zero
-        log_probs = []
-        ind = 0
-        n_minibatches = len(cell_data_loader)
-        analyzed_gene_inds = torch.tensor(self.analyzed_gene_inds.copy())
-        if analyzed_bcs_only:
-            barcode_inds = torch.tensor(self.dataset_obj.analyzed_barcode_inds.copy())
-        else:
-            barcode_inds = torch.tensor(self.barcode_inds.copy())
-        nonzero_noise_offset_dict = {}
+                bcs = []  # barcode index
+                genes = []  # gene index
+                c = []  # noise count value
+                c_offset = []  # noise count offsets from zero
+                log_probs = []
+                ind = 0
+                n_minibatches = len(cell_data_loader)
+                analyzed_gene_inds = torch.tensor(self.analyzed_gene_inds.copy())
+                if analyzed_bcs_only:
+                    barcode_inds = torch.tensor(self.dataset_obj.analyzed_barcode_inds.copy())
+                else:
+                    barcode_inds = torch.tensor(self.barcode_inds.copy())
+                nonzero_noise_offset_dict = {}
 
-        logger.info('Computing posterior noise count probabilities in mini-batches.')
+                logger.info('Computing posterior noise count probabilities in mini-batches.')
 
-        for i, data in enumerate(cell_data_loader):
+                for i, data in enumerate(cell_data_loader):
 
-            if i == 0:
-                t = time.time()
-            elif i == 1:
-                logger.info(f'    [{(time.time() - t) / 60:.2f} mins per chunk]')
-            logger.info(f'Working on chunk ({i + 1}/{n_minibatches})')
+                    if i == 0:
+                        t = time.time()
+                    elif i == 1:
+                        logger.info(f'    [{(time.time() - t) / 60:.2f} mins per chunk]')
+                    logger.info(f'Working on chunk ({i + 1}/{n_minibatches})')
 
-            if self.debug:
-                logger.debug(f'Posterior minibatch starting with droplet {ind}')
-                logger.debug('\n' + get_hardware_usage(use_cuda=self.use_cuda))
+                    if self.debug:
+                        logger.debug(f'Posterior minibatch starting with droplet {ind}')
+                        logger.debug('\n' + get_hardware_usage(use_cuda=self.use_cuda))
 
-            # Compute noise count probabilities.
-            noise_log_pdf_NGC, noise_count_offset_NG = self.noise_log_pdf(
-                data=data,
-                n_samples=n_samples,
-                y_map=y_map,
-                n_counts_max=n_counts_max,
-            )
+                    # Compute noise count probabilities.
+                    noise_log_pdf_NGC, noise_count_offset_NG = self.noise_log_pdf(
+                        data=data,
+                        n_samples=n_samples,
+                        y_map=y_map,
+                        n_counts_max=n_counts_max,
+                    )
 
-            # Compute a tensor to indicate sparsity.
-            # First we want data = 0 to be all zeros
-            # We also want anything below the threshold to be a zero
-            tensor_for_nonzeros = noise_log_pdf_NGC.clone().exp()  # probability
-            tensor_for_nonzeros.data[data == 0, :] = 0.  # remove data = 0
-            tensor_for_nonzeros.data[noise_log_pdf_NGC < smallest_log_probability] = 0.
+                    # Compute a tensor to indicate sparsity.
+                    # First we want data = 0 to be all zeros
+                    # We also want anything below the threshold to be a zero
+                    tensor_for_nonzeros = noise_log_pdf_NGC.clone().exp()  # probability
+                    tensor_for_nonzeros.data[data == 0, :] = 0.  # remove data = 0
+                    tensor_for_nonzeros.data[noise_log_pdf_NGC < smallest_log_probability] = 0.
 
-            # Convert to sparse format using "m" indices.
-            bcs_i_chunk, genes_i_analyzed, c_i, log_prob_i = dense_to_sparse_op_torch(
-                noise_log_pdf_NGC,
-                tensor_for_nonzeros=tensor_for_nonzeros,
-            )
+                    # Convert to sparse format using "m" indices.
+                    bcs_i_chunk, genes_i_analyzed, c_i, log_prob_i = dense_to_sparse_op_torch(
+                        noise_log_pdf_NGC,
+                        tensor_for_nonzeros=tensor_for_nonzeros,
+                    )
 
-            # Get the original gene index from gene index in the trimmed dataset.
-            genes_i = analyzed_gene_inds[genes_i_analyzed.cpu()]
+                    # Get the original gene index from gene index in the trimmed dataset.
+                    genes_i = analyzed_gene_inds[genes_i_analyzed.cpu()]
 
-            # Barcode index in the dataloader.
-            bcs_i = (bcs_i_chunk + ind).cpu()
+                    # Barcode index in the dataloader.
+                    bcs_i = (bcs_i_chunk + ind).cpu()
 
-            # Obtain the real barcode index since we only use cells.
-            bcs_i = dataloader_index_to_analyzed_bc_index[bcs_i]
+                    # Obtain the real barcode index since we only use cells.
+                    bcs_i = dataloader_index_to_analyzed_bc_index[bcs_i]
 
-            # Translate chunk barcode inds to overall inds.
-            bcs_i = barcode_inds[bcs_i]
+                    # Translate chunk barcode inds to overall inds.
+                    bcs_i = barcode_inds[bcs_i]
 
-            # Add sparse matrix values to lists.
-            bcs.append(bcs_i.detach())
-            genes.append(genes_i.detach())
-            c.append(c_i.detach().cpu())
-            log_probs.append(log_prob_i.detach().cpu())
+                    # Add sparse matrix values to lists.
+                    bcs.append(bcs_i.detach())
+                    genes.append(genes_i.detach())
+                    c.append(c_i.detach().cpu())
+                    log_probs.append(log_prob_i.detach().cpu())
 
-            # Update offset dict with any nonzeros.
-            nonzero_offset_inds, nonzero_noise_count_offsets = dense_to_sparse_op_torch(
-                noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().flatten(),
-            )
-            m_i = self.index_converter.get_m_indices(cell_inds=bcs_i, gene_inds=genes_i)
+                    # Update offset dict with any nonzeros.
+                    nonzero_offset_inds, nonzero_noise_count_offsets = dense_to_sparse_op_torch(
+                        noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().flatten(),
+                    )
+                    m_i = self.index_converter.get_m_indices(cell_inds=bcs_i, gene_inds=genes_i)
 
-            nonzero_noise_offset_dict.update(
-                dict(zip(m_i[nonzero_offset_inds.detach().cpu()].tolist(),
-                         nonzero_noise_count_offsets.detach().cpu().tolist()))
-            )
-            c_offset.append(noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().cpu())
+                    nonzero_noise_offset_dict.update(
+                        dict(zip(m_i[nonzero_offset_inds.detach().cpu()].tolist(),
+                                 nonzero_noise_count_offsets.detach().cpu().tolist()))
+                    )
+                    c_offset.append(noise_count_offset_NG[bcs_i_chunk, genes_i_analyzed].detach().cpu())
 
-            # Increment barcode index counter.
-            ind += data.shape[0]  # Same as data_loader.batch_size
+                    # Increment barcode index counter.
+                    ind += data.shape[0]  # Same as data_loader.batch_size
+                break
+            except RuntimeError as error:
+                batch_size = self._log_cuda_oom_and_reduce_batch_size(
+                    error=error,
+                    batch_size=batch_size,
+                    operation_name='posterior computation',
+                )
 
         # Concatenate lists.
         log_probs = torch.cat(log_probs)
@@ -844,46 +880,56 @@ class Posterior:
             self._latents = {'z': None, 'd': None, 'p': None, 'phi_loc_scale': None, 'epsilon': None}
             return None
 
-        data_loader = self.dataset_obj.get_dataloader(use_cuda=self.use_cuda,
-                                                      analyzed_bcs_only=True,
-                                                      batch_size=500,
-                                                      shuffle=False)
+        batch_size = min(500, self.posterior_batch_size)
+        while True:
+            try:
+                data_loader = self.dataset_obj.get_dataloader(use_cuda=self.use_cuda,
+                                                              analyzed_bcs_only=True,
+                                                              batch_size=batch_size,
+                                                              shuffle=False)
 
-        n_analyzed = data_loader.dataset.shape[0]
+                n_analyzed = data_loader.dataset.shape[0]
 
-        z = np.zeros((n_analyzed, self.vi_model.encoder['z'].output_dim))
-        d = np.zeros(n_analyzed)
-        p = np.zeros(n_analyzed)
-        epsilon = np.zeros(n_analyzed)
+                z = np.zeros((n_analyzed, self.vi_model.encoder['z'].output_dim))
+                d = np.zeros(n_analyzed)
+                p = np.zeros(n_analyzed)
+                epsilon = np.zeros(n_analyzed)
 
-        phi_loc = pyro.param('phi_loc')
-        phi_scale = pyro.param('phi_scale')
-        if 'chi_ambient' in pyro.get_param_store().keys():
-            chi_ambient = pyro.param('chi_ambient').detach()
-        else:
-            chi_ambient = None
+                phi_loc = pyro.param('phi_loc')
+                phi_scale = pyro.param('phi_scale')
+                if 'chi_ambient' in pyro.get_param_store().keys():
+                    chi_ambient = pyro.param('chi_ambient').detach()
+                else:
+                    chi_ambient = None
 
-        start = 0
-        for i, data in enumerate(data_loader):
+                start = 0
+                for i, data in enumerate(data_loader):
 
-            end = start + data.shape[0]
+                    end = start + data.shape[0]
 
-            enc = self.vi_model.encoder(x=data,
-                                        chi_ambient=chi_ambient,
-                                        cell_prior_log=self.vi_model.d_cell_loc_prior)
-            z[start:end, :] = enc['z']['loc'].detach().cpu().numpy()
+                    enc = self.vi_model.encoder(x=data,
+                                                chi_ambient=chi_ambient,
+                                                cell_prior_log=self.vi_model.d_cell_loc_prior)
+                    z[start:end, :] = enc['z']['loc'].detach().cpu().numpy()
 
-            d[start:end] = \
-                dist.LogNormal(loc=enc['d_loc'],
-                               scale=pyro.param('d_cell_scale')).mean.detach().cpu().numpy()
+                    d[start:end] = \
+                        dist.LogNormal(loc=enc['d_loc'],
+                                       scale=pyro.param('d_cell_scale')).mean.detach().cpu().numpy()
 
-            p[start:end] = enc['p_y'].sigmoid().detach().cpu().numpy()
+                    p[start:end] = enc['p_y'].sigmoid().detach().cpu().numpy()
 
-            epsilon[start:end] = \
-                dist.Gamma(enc['epsilon'] * self.vi_model.epsilon_prior,
-                           self.vi_model.epsilon_prior).mean.detach().cpu().numpy()
+                    epsilon[start:end] = \
+                        dist.Gamma(enc['epsilon'] * self.vi_model.epsilon_prior,
+                                   self.vi_model.epsilon_prior).mean.detach().cpu().numpy()
 
-            start = end
+                    start = end
+                break
+            except RuntimeError as error:
+                batch_size = self._log_cuda_oom_and_reduce_batch_size(
+                    error=error,
+                    batch_size=batch_size,
+                    operation_name='latent variable encoding',
+                )
 
         self._latents = {'z': z,
                          'd': d,

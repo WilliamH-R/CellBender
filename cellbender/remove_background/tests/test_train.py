@@ -8,7 +8,7 @@ import scipy.sparse as sp
 from pyro.infer.svi import SVI
 import unittest.mock
 
-from cellbender.remove_background.run import get_optimizer
+from cellbender.remove_background.run import get_optimizer, get_default_training_batch_size
 from cellbender.remove_background.data.dataprep import prep_sparse_data_for_training \
     as prep_data_for_training
 from cellbender.remove_background.train import train_epoch, evaluate_epoch
@@ -108,6 +108,16 @@ def test_one_cycle_scheduler(dropped_minibatch, cuda):
                        match=r"Tried to step .* times. The specified number "
                              r"of total steps is .*"):
         svi.optim.step()
+
+
+def test_get_default_training_batch_size():
+
+    class Dataset:
+        analyzed_barcode_inds = torch.arange(1000)
+
+    assert get_default_training_batch_size(dataset_obj=Dataset(), training_fraction=1.0) == 256
+    assert get_default_training_batch_size(dataset_obj=Dataset(), training_fraction=0.1) == 50
+    assert get_default_training_batch_size(dataset_obj=Dataset(), training_fraction=0.001) == 4
 
 
 @pytest.mark.skip

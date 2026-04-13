@@ -13,6 +13,8 @@ import os
 import sys
 import argparse
 
+import cellbender.remove_background.consts as consts
+
 
 class CLI(AbstractCLI):
     """CLI implements AbstractCLI from the cellbender package."""
@@ -69,6 +71,9 @@ class CLI(AbstractCLI):
 
         assert args.learning_rate < 0.1, "learning-rate must be < 0.1"
         assert args.learning_rate > 0, "learning-rate must be > 0"
+        if args.training_batch_size is not None:
+            assert args.training_batch_size >= consts.SMALLEST_ALLOWED_BATCH, \
+                f"--training-batch-size must be >= {consts.SMALLEST_ALLOWED_BATCH}"
 
         # Set training_fraction to consts.TRAINING_FRACTION (which is 1.).
         # args.training_fraction = consts.TRAINING_FRACTION

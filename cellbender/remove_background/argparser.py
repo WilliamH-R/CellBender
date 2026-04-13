@@ -180,6 +180,14 @@ def add_subparser_args(subparsers: argparse) -> argparse:
                                 "is used, where the upper learning rate is ten "
                                 "times this value. (For this value, probably "
                                 "do not exceed 1e-3).")
+    subparser.add_argument("--training-batch-size", type=int,
+                           default=None,
+                           dest="training_batch_size",
+                           help="Training detail: size of minibatches during "
+                                "variational inference. By default, "
+                                "CellBender chooses a value automatically. "
+                                "Reduce this to avoid running out of GPU "
+                                "memory during training (will be slower).")
     subparser.add_argument("--checkpoint-mins",
                            type=float, default=7.,
                            dest="checkpoint_min",

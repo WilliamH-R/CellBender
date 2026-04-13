@@ -23,6 +23,7 @@ from cellbender.remove_background.sparse_utils import csr_set_rows_to_zero
 from cellbender.remove_background.data.io import write_matrix_to_cellranger_h5
 from cellbender.remove_background.report import run_notebook_make_html, plot_summary
 from cellbender.remove_background.checkpoint import create_workflow_hashcode
+from cellbender.remove_background.memory import is_cuda_oom_error, get_reduced_batch_size
 
 import pyro
 from pyro.infer import SVI, JitTraceEnum_ELBO, JitTrace_ELBO, \
@@ -51,6 +52,15 @@ import matplotlib.pyplot as plt  # This needs to be after matplotlib.use('Agg')
 logger = logging.getLogger('cellbender')
 
 
+def get_default_training_batch_size(dataset_obj: SingleCellRNACountsDataset,
+                                    training_fraction: float) -> int:
+    """Choose the default minibatch size for training."""
+
+    return max(consts.SMALLEST_ALLOWED_BATCH,
+               int(min(consts.MAX_BATCH_SIZE,
+                       training_fraction * dataset_obj.analyzed_barcode_inds.size / 2)))
+
+
 def run_remove_background(args: argparse.Namespace) -> Posterior:
     """The full script for the command line tool to remove background RNA.
 
@@ -72,7 +82,8 @@ def run_remove_background(args: argparse.Namespace) -> Posterior:
                          # The following settings do not affect the results, and can change when retrying,
                          # so remove them.
                          'epoch_elbo_fail_fraction', 'final_elbo_fail_fraction',
-                         'num_failed_attempts', 'checkpoint_filename']
+                         'num_failed_attempts', 'checkpoint_filename',
+                         'training_batch_size']
                         + (['epochs'] if args.constant_learning_rate else [])),
         args=args)[:10]
     args.checkpoint_filename = hashcode  # store this in args
@@ -274,7 +285,7 @@ def compute_output_denoised_counts_reports_metrics(posterior: Posterior,
                 raw_count_matrix=posterior.dataset_obj.data['matrix'],
                 fpr=fpr,
                 per_gene=True if (args.posterior_regularization == 'PRmu_gene') else False,
-                device='cuda',
+                device='cuda' if args.use_cuda else 'cpu',
             )
         else:
             # Other posterior regularizations were already performed in
@@ -698,27 +709,50 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
 
         # Load the dataset into DataLoaders.
         frac = args.training_fraction  # Fraction of barcodes to use for training
-        batch_size = int(min(consts.MAX_BATCH_SIZE, frac * dataset_obj.analyzed_barcode_inds.size / 2))
+        batch_size = (args.training_batch_size
+                      if args.training_batch_size is not None
+                      else get_default_training_batch_size(dataset_obj=dataset_obj,
+                                                           training_fraction=frac))
 
-        # Set up dataloaders.
-        train_loader, test_loader = \
-            prep_data_for_training(dataset=count_matrix,
-                                   empty_drop_dataset=dataset_obj.get_count_matrix_empties(),
-                                   batch_size=batch_size,
-                                   training_fraction=frac,
-                                   fraction_empties=args.fraction_empties,
-                                   shuffle=True,
-                                   use_cuda=args.use_cuda)
+        while True:
+            try:
+                # Set up dataloaders.
+                train_loader, test_loader = \
+                    prep_data_for_training(dataset=count_matrix,
+                                           empty_drop_dataset=dataset_obj.get_count_matrix_empties(),
+                                           batch_size=batch_size,
+                                           training_fraction=frac,
+                                           fraction_empties=args.fraction_empties,
+                                           shuffle=True,
+                                           use_cuda=args.use_cuda)
 
-        # Set up optimizer (optionally wrapped in a learning rate scheduler).
-        scheduler = get_optimizer(
-            n_batches=len(train_loader),
-            batch_size=train_loader.batch_size,
-            epochs=args.epochs,
-            learning_rate=args.learning_rate,
-            constant_learning_rate=args.constant_learning_rate,
-            total_epochs_for_testing_only=total_epochs_for_testing_only,
-        )
+                # Set up optimizer (optionally wrapped in a learning rate scheduler).
+                scheduler = get_optimizer(
+                    n_batches=len(train_loader),
+                    batch_size=train_loader.batch_size,
+                    epochs=args.epochs,
+                    learning_rate=args.learning_rate,
+                    constant_learning_rate=args.constant_learning_rate,
+                    total_epochs_for_testing_only=total_epochs_for_testing_only,
+                )
+                args.training_batch_size = batch_size
+                break
+            except RuntimeError as error:
+                if not (args.use_cuda and is_cuda_oom_error(error)):
+                    raise
+                new_batch_size = get_reduced_batch_size(batch_size)
+                if new_batch_size is None:
+                    raise RuntimeError(
+                        'CUDA ran out of memory while setting up training and '
+                        f'CellBender could not reduce the minibatch size below '
+                        f'{batch_size}. Try running on CPU or reducing the '
+                        'number of analyzed droplets/features.'
+                    ) from error
+                logger.warning('CUDA out of memory during training setup with '
+                               f'batch size {batch_size}. Retrying with batch '
+                               f'size {new_batch_size}.')
+                torch.cuda.empty_cache()
+                batch_size = new_batch_size
 
     # Determine the loss function.
     if args.use_jit:
@@ -758,49 +792,72 @@ def run_inference(dataset_obj: SingleCellRNACountsDataset,
 
     else:
         logger.info("Running inference...")
-        try:
-            run_training(model=model,
-                         args=args,
-                         svi=svi,
-                         train_loader=train_loader,
-                         test_loader=test_loader,
-                         epochs=args.epochs,
-                         test_freq=5,
-                         output_filename=checkpoint_filename,
-                         ckpt_tarball_name=output_checkpoint_tarball,
-                         checkpoint_freq=args.checkpoint_min,
-                         epoch_elbo_fail_fraction=args.epoch_elbo_fail_fraction,
-                         final_elbo_fail_fraction=args.final_elbo_fail_fraction)
+        while True:
+            try:
+                run_training(model=model,
+                             args=args,
+                             svi=svi,
+                             train_loader=train_loader,
+                             test_loader=test_loader,
+                             epochs=args.epochs,
+                             test_freq=5,
+                             output_filename=checkpoint_filename,
+                             ckpt_tarball_name=output_checkpoint_tarball,
+                             checkpoint_freq=args.checkpoint_min,
+                             epoch_elbo_fail_fraction=args.epoch_elbo_fail_fraction,
+                             final_elbo_fail_fraction=args.final_elbo_fail_fraction)
+                break
+            except RuntimeError as error:
+                if ckpt_loaded or not (args.use_cuda and is_cuda_oom_error(error)):
+                    raise
+                new_batch_size = get_reduced_batch_size(train_loader.batch_size)
+                if new_batch_size is None:
+                    raise RuntimeError(
+                        'CUDA ran out of memory during training even at the '
+                        f'minimum supported minibatch size '
+                        f'{train_loader.batch_size}. Try running without '
+                        '--cuda or reducing the number of analyzed '
+                        'droplets/features.'
+                    ) from error
+                logger.warning('CUDA out of memory during training with batch '
+                               f'size {train_loader.batch_size}. Restarting '
+                               f'training from scratch with batch size '
+                               f'{new_batch_size}.')
+                torch.cuda.empty_cache()
+                args.training_batch_size = new_batch_size
+                return run_inference(dataset_obj=dataset_obj,
+                                     args=args,
+                                     output_checkpoint_tarball=output_checkpoint_tarball,
+                                     total_epochs_for_testing_only=total_epochs_for_testing_only)
+            except ElboException:
 
-        except ElboException:
+                logger.warning(traceback.format_exc())
 
-            logger.warning(traceback.format_exc())
+                # Keep track of number of failed attempts.
+                if not hasattr(args, 'num_failed_attempts'):
+                    args.num_failed_attempts = 1
+                else:
+                    args.num_failed_attempts = args.num_failed_attempts + 1
+                logger.debug(f'Training failed, and the number of failed attempts '
+                             f'on record is {args.num_failed_attempts}')
 
-            # Keep track of number of failed attempts.
-            if not hasattr(args, 'num_failed_attempts'):
-                args.num_failed_attempts = 1
-            else:
-                args.num_failed_attempts = args.num_failed_attempts + 1
-            logger.debug(f'Training failed, and the number of failed attempts '
-                         f'on record is {args.num_failed_attempts}')
-
-            # Retry training with reduced learning rate, if indicated by user.
-            logger.debug(f'Number of times to retry training is {args.num_training_tries}')
-            if args.num_failed_attempts < args.num_training_tries:
-                args.learning_rate = args.learning_rate * args.learning_rate_retry_mult
-                logger.info(f'Restarting training: attempt {args.num_failed_attempts + 1}, '
-                            f'learning_rate = {args.learning_rate}')
-                run_remove_background(args)  # start from scratch
-                sys.exit(0)
-            else:
-                logger.info(f'No more attempts are specified by --num-training-tries. '
-                            f'Therefore the workflow will run once more without ELBO restrictions.')
-                args.epoch_elbo_fail_fraction = None
-                args.final_elbo_fail_fraction = None
-                run_remove_background(args)  # start from scratch
-                # non-zero exit status in order to draw user's attention to the fact that ELBO tests
-                # were never satisfied.
-                sys.exit(1)
+                # Retry training with reduced learning rate, if indicated by user.
+                logger.debug(f'Number of times to retry training is {args.num_training_tries}')
+                if args.num_failed_attempts < args.num_training_tries:
+                    args.learning_rate = args.learning_rate * args.learning_rate_retry_mult
+                    logger.info(f'Restarting training: attempt {args.num_failed_attempts + 1}, '
+                                f'learning_rate = {args.learning_rate}')
+                    run_remove_background(args)  # start from scratch
+                    sys.exit(0)
+                else:
+                    logger.info(f'No more attempts are specified by --num-training-tries. '
+                                f'Therefore the workflow will run once more without ELBO restrictions.')
+                    args.epoch_elbo_fail_fraction = None
+                    args.final_elbo_fail_fraction = None
+                    run_remove_background(args)  # start from scratch
+                    # non-zero exit status in order to draw user's attention to the fact that ELBO tests
+                    # were never satisfied.
+                    sys.exit(1)
 
         logger.info("Inference procedure complete.")
 
