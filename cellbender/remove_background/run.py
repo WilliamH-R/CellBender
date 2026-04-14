@@ -263,7 +263,10 @@ def compute_output_denoised_counts_reports_metrics(posterior: Posterior,
             index_converter=posterior.index_converter,
             raw_count_csr_for_cells=cell_counts,
             n_cells=len(cell_inds),
-            device='cuda' if args.use_cuda else 'cpu',  # TODO check this
+            # This helper densifies chunks of the sparse posterior before applying
+            # a mean reduction. Running it on GPU can spike VRAM late in the
+            # pipeline, even after inference succeeds, while CPU is fast enough.
+            device='cpu',
             per_gene=True,
         )
         noise_target_fun = lambda x: noise_target_fun_per_cell(x) * len(cell_inds)
